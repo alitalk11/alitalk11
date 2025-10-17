@@ -479,8 +479,6 @@ async function fetchByCategory({ categoryId }) {
 
   const listTasks = { item: [], dataBaseRes: [] };
 
-  // await processDivided(divided, listTasks);
-
   const categoryRes = divided[10].map((item) =>
     limit(async () => {
       const cat = await ProductCategories.findOne({
@@ -504,44 +502,38 @@ async function fetchByCategory({ categoryId }) {
           .lean({ virtuals: true });
       }
 
-      // const res = await ProductDetail.find({
-      //   $or: [{ cId1: cat._id }, { cId2: cat._id }],
-      // })
-      //   .populate("cId1", "cId cn")
-      //   .populate("cId2", "cId cn")
-      //   .lean({ virtuals: true });
-
       const { items, raw, serverCount, filteredCount, note } =
         await fetchByCategory({
           categoryId: item.cId,
         });
 
-      // 기존 DB에 동일 카테고리 상품들 조회 (짧은 저장 키 사용)
-      // if (!item.parent_category_id) {
-      //   res = await ProductDetail.find({ cId1: item.category_id });
-      // } else {
-      //   res = await ProductDetail.find({ ci2: item.category_id });
-      // }
-
       console.log("cid:", item.cId);
       console.log("items:", items.length);
       console.log("res:", res.length);
-
-      // if (items.length) {
-      //   console.log(items.slice(0, 5));
-      // } else {
-      //   console.log(raw?.error_response ?? raw);
-      // }
 
       listTasks.item.push(...items);
       listTasks.dataBaseRes.push(...res);
     })
   );
 
+  await Promise.allSettled(categoryRes, listTasks);
+
+  // const categoryRes = async () => {
+  //   let res = await ProductDetail.find({ _id: "1005006904659296" })
+  //     .populate("cId1", "cId cn")
+  //     .populate("cId2", "cId cn")
+  //     .lean({ virtuals: true });
+
+  //   // listTasks.item.push(...items);
+  //   listTasks.dataBaseRes.push(...res);
+  // };
+
+  // await categoryRes();
+
   // 데이터베이스에 있는건 volume 200 안넘어도 업데이트
 
-  await Promise.allSettled(categoryRes, listTasks);
-  // const ProductIdList = listTasks;
+  // await processDivided(divided, listTasks);
+
   console.log("dataBaseRes", listTasks.dataBaseRes.length);
   console.log("item", listTasks.item.length);
 
@@ -629,7 +621,6 @@ async function fetchByCategory({ categoryId }) {
 
             if (Number(productData?.items[0]?.volume) > 0) {
               baseDoc.vol = productData.items[0].volume;
-              console.log("baseDoc:", productData.items[0].volume);
             }
           }
 
@@ -714,16 +705,19 @@ async function fetchByCategory({ categoryId }) {
           // 4) 기존 문서의 sku_id 집합만 얇게 조회 — 경로 "sku_info.sil"
           const doc = await ProductDetail.findById(productId)
             .select(
-              "sku_info.sil.sId sku_info.sil.c sku_info.sil.sp sku_info.sil.pd"
+              "sku_info.sil.sId sku_info.sil.c sku_info.sil.sp sku_info.sil.pd sku_info.sil.spKey"
             )
             .lean();
 
           const toNum = (v) => (v == null ? NaN : +v);
           const safeNorm = (v) => norm(v ?? "");
+          // const toKey = (sid, color, props) =>
+          //   `${String(sid)}\u0001${normalizeCForCompare(
+          //     color
+          //   )}\u0001${normalizeSpForCompare(props)}`;
           const toKey = (sid, color, props) =>
-            `${String(sid)}\u0001${safeNorm(
-              color
-            )}\u0001${normalizeSpForCompare(props)}`;
+            `${String(sid)}
+            \u0001${normalizeSpForCompare(props)}`;
 
           // 필요한 필드만
 
@@ -731,10 +725,14 @@ async function fetchByCategory({ categoryId }) {
           const existingIds = new Set(
             (doc?.sku_info?.sil ?? []).map((d) => String(d?.sId))
           );
-          const skuMap = new Map();
+          const skuMap1 = new Map();
+          const skuMap2 = new Map();
           for (const sku of sil) {
-            const k = toKey(sku?.sId, sku?.c, sku?.sp);
-            skuMap.set(k, sku);
+            const k = toKey(sku?.sId, sku?.c, canonSkuProps(sku?.sp));
+            const j = toKey(sku?.sId, sku?.c, normalizeSpForCompare(sku?.sp));
+
+            skuMap1.set(k, sku);
+            skuMap2.set(j, sku);
           }
 
           const newSkus = [];
@@ -749,14 +747,25 @@ async function fetchByCategory({ categoryId }) {
               newSkus.push(item);
               continue;
             }
+            const key1 = toKey(
+              sid,
+              item?.color,
+              canonSkuProps(item?.sku_properties)
+            );
 
-            const key = toKey(sid, item?.color, item?.sku_properties);
+            const exist1 = skuMap1.get(key1);
+            // console.log("exist1:", exist1);
 
-            const exist = skuMap.get(key);
+            if (!exist1) {
+              const SPKEY = normalizeSpForCompare(item?.sku_properties);
 
-            if (!exist) {
-              newSkus.push(item);
-              continue;
+              const key2 = toKey(sid, item?.color, SPKEY);
+              const exist2 = skuMap2.get(key2);
+
+              if (!exist2) {
+                newSkus.push(item);
+                continue;
+              }
             }
             // 문제 지점 전후로 세분화 try-catch
             let incomingSale;
@@ -768,7 +777,7 @@ async function fetchByCategory({ categoryId }) {
             }
             let docToday, docSale;
             try {
-              docToday = exist?.pd?.[todayKey];
+              docToday = exist1?.pd?.[todayKey];
               docSale = toNum(docToday?.s);
             } catch (e) {
               throw e;
@@ -841,14 +850,18 @@ async function fetchByCategory({ categoryId }) {
                   {
                     "e.sId": sId,
                     $and: [
+                      // {
+                      //   $or: [
+                      //     { "e.c": cNorm },
+                      //     { "e.c": { $regex: cRegex, $options: "x" } },
+                      //   ],
+                      // },
                       {
                         $or: [
-                          { "e.c": cNorm },
-                          { "e.c": { $regex: cRegex, $options: "x" } },
+                          { "e.spKey": spKey },
+                          { "e.sp": spCanon },
+                          { "e.sp": s.sku_properties },
                         ],
-                      },
-                      {
-                        $or: [{ "e.spKey": spKey }, { "e.sp": spCanon }],
                       },
                     ],
                   },
@@ -868,6 +881,7 @@ async function fetchByCategory({ categoryId }) {
             const spRegex = makeSpaceAgnosticPattern(spCanon);
             const cRegex = makeSpaceAgnosticPattern(cNorm);
 
+            console.log("item:", item._id);
             console.log("당일 최저가:!!");
 
             const pricePoint = {
@@ -894,14 +908,18 @@ async function fetchByCategory({ categoryId }) {
                   {
                     "e.sId": sId,
                     $and: [
+                      // {
+                      //   $or: [
+                      //     { "e.c": cNorm },
+                      //     { "e.c": { $regex: cRegex, $options: "x" } },
+                      //   ],
+                      // },
                       {
                         $or: [
-                          { "e.c": cNorm },
-                          { "e.c": { $regex: cRegex, $options: "x" } },
+                          { "e.spKey": spKey },
+                          { "e.sp": spCanon },
+                          { "e.sp": s.sku_properties },
                         ],
-                      },
-                      {
-                        $or: [{ "e.spKey": spKey }, { "e.sp": spCanon }],
                       },
                     ],
                   },
@@ -912,20 +930,27 @@ async function fetchByCategory({ categoryId }) {
 
           // 5-4) 새로 발견된 sku들을 push
           if (newSkus.length > 0 && doc) {
-            const toPush = newSkus.map((s) => ({
-              sId: String(s?.sku_id),
-              c: s?.color ?? "",
-              link: s.link,
-              sp: s.sku_properties ?? "",
-              cur: s.currency ?? "KRW",
-              pd: {
-                [todayKey]: {
-                  p: s.price_with_tax,
-                  s: s.sale_price_with_tax,
-                  t: new Date(),
+            const toPush = newSkus.map((s) => {
+              const spKey = normalizeSpForCompare(s.sku_properties);
+              const cNorm = colorNorm(s.color);
+              const spCanon = canonSkuProps(s.sku_properties);
+
+              return {
+                sId: String(s?.sku_id),
+                c: cNorm ?? "",
+                link: s.link,
+                sp: spCanon ?? "",
+                spKey: spKey ?? "",
+                cur: s.currency ?? "KRW",
+                pd: {
+                  [todayKey]: {
+                    p: s.price_with_tax,
+                    s: s.sale_price_with_tax,
+                    t: new Date(),
+                  },
                 },
-              },
-            }));
+              };
+            });
 
             ops.push({
               updateOne: {
